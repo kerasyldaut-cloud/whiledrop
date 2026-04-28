@@ -5,6 +5,7 @@ import { createClient } from '@/lib/supabase/client'
 import { useRouter } from 'next/navigation'
 import Link from 'next/link'
 
+// Login form component
 export function LoginForm() {
   const [email, setEmail] = useState('')
   const [password, setPassword] = useState('')
