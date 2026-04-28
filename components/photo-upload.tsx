@@ -17,6 +17,13 @@ export function PhotoUpload({ onUpload, onSkip }: PhotoUploadProps) {
   const fileInputRef = useRef<HTMLInputElement>(null)
   const base64Ref = useRef<string | null>(null)
 
+  // Keep latest onUpload in a ref so the progress effect doesn't restart
+  // when the parent recreates the callback (e.g. when weather data loads).
+  const onUploadRef = useRef(onUpload)
+  useEffect(() => {
+    onUploadRef.current = onUpload
+  }, [onUpload])
+
   useEffect(() => {
     setFadeIn(true)
   }, [])
@@ -29,6 +36,7 @@ export function PhotoUpload({ onUpload, onSkip }: PhotoUploadProps) {
         const result = reader.result as string
         setPreview(result)
         base64Ref.current = result
+        setProgress(0)
         setIsAnalyzing(true)
       }
       reader.readAsDataURL(file)
@@ -36,26 +44,33 @@ export function PhotoUpload({ onUpload, onSkip }: PhotoUploadProps) {
   }
 
   useEffect(() => {
-    if (isAnalyzing) {
-      const interval = setInterval(() => {
-        setProgress((prev) => {
-          if (prev >= 100) {
+    if (!isAnalyzing) return
+
+    let completed = false
+    const interval = setInterval(() => {
+      setProgress((prev) => {
+        if (prev >= 100) {
+          if (!completed) {
+            completed = true
             clearInterval(interval)
             setTimeout(() => {
               const file = fileInputRef.current?.files?.[0] || null
-              onUpload(file, base64Ref.current)
+              onUploadRef.current(file, base64Ref.current)
             }, 300)
-            return 100
           }
-          return prev + 2
-        })
-      }, 50)
-      return () => clearInterval(interval)
-    }
-  }, [isAnalyzing, onUpload])
+          return 100
+        }
+        return prev + 2
+      })
+    }, 50)
+
+    return () => clearInterval(interval)
+  }, [isAnalyzing])
 
   return (
-    <div className={`flex flex-col gap-6 transition-all duration-300 ${fadeIn ? 'opacity-100 translate-y-0' : 'opacity-0 translate-y-4'}`}>
+    <div
+      className={`flex flex-col gap-6 transition-all duration-300 ${fadeIn ? 'opacity-100 translate-y-0' : 'opacity-0 translate-y-4'}`}
+    >
       <div className="text-center">
         <h2 className="text-lg font-medium text-foreground mb-2">
           Upload Your Current Outfit
@@ -83,7 +98,7 @@ export function PhotoUpload({ onUpload, onSkip }: PhotoUploadProps) {
         <div className="flex flex-col gap-4">
           <div className="relative w-32 h-32 mx-auto bg-muted overflow-hidden">
             <Image
-              src={preview}
+              src={preview || '/placeholder.svg'}
               alt="Uploaded outfit"
               fill
               className="object-cover"

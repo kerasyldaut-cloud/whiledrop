@@ -1,6 +1,7 @@
 'use client'
 
-import { useState, useCallback, useEffect } from 'react'
+import { useState, useEffect, useRef } from 'react'
+import { useRouter } from 'next/navigation'
 import { ProfileForm } from '@/components/profile-form'
 import { PhotoUpload } from '@/components/photo-upload'
 import { OutfitCard } from '@/components/outfit-card'
@@ -14,48 +15,69 @@ import type { User as SupabaseUser } from '@supabase/supabase-js'
 import Link from 'next/link'
 
 export default function Home() {
+  const router = useRouter()
   const [currentStep, setCurrentStep] = useState<AppStep>('form')
   const [userProfile, setUserProfile] = useState<UserProfile | null>(null)
   const [outfits, setOutfits] = useState<OutfitResult[]>([])
   const [isGenerating, setIsGenerating] = useState(false)
-  const [coords, setCoords] = useState<{ lat: number; lon: number } | null>(null)
+  const [coords, setCoords] = useState<{ lat: number; lon: number } | null>(
+    null,
+  )
   const [photoAnalysis, setPhotoAnalysis] = useState<string | null>(null)
   const [user, setUser] = useState<SupabaseUser | null>(null)
   const [fadeIn, setFadeIn] = useState(false)
 
   const { weather, isLoading: weatherLoading } = useWeather(coords)
-  const supabase = createClient()
+  // Defer client creation so prerender doesn't read missing env vars.
+  const [supabase] = useState(() => createClient())
+
+  // Stable refs so callbacks don't capture stale values.
+  const weatherRef = useRef(weather)
+  const photoAnalysisRef = useRef(photoAnalysis)
+  const userProfileRef = useRef(userProfile)
+  useEffect(() => {
+    weatherRef.current = weather
+  }, [weather])
+  useEffect(() => {
+    photoAnalysisRef.current = photoAnalysis
+  }, [photoAnalysis])
+  useEffect(() => {
+    userProfileRef.current = userProfile
+  }, [userProfile])
 
   // Check auth state
   useEffect(() => {
     const checkUser = async () => {
-      const { data: { user } } = await supabase.auth.getUser()
+      const {
+        data: { user },
+      } = await supabase.auth.getUser()
       setUser(user)
     }
     checkUser()
 
-    const { data: { subscription } } = supabase.auth.onAuthStateChange((_event, session) => {
+    const {
+      data: { subscription },
+    } = supabase.auth.onAuthStateChange((_event, session) => {
       setUser(session?.user ?? null)
     })
 
     return () => subscription.unsubscribe()
-  }, [supabase.auth])
+  }, [supabase])
 
   // Get user location
   useEffect(() => {
-    if (navigator.geolocation) {
-      navigator.geolocation.getCurrentPosition(
-        (position) => {
-          setCoords({
-            lat: position.coords.latitude,
-            lon: position.coords.longitude,
-          })
-        },
-        () => {
-          // Silent fail - weather just won't show
-        }
-      )
-    }
+    if (typeof navigator === 'undefined' || !navigator.geolocation) return
+    navigator.geolocation.getCurrentPosition(
+      (position) => {
+        setCoords({
+          lat: position.coords.latitude,
+          lon: position.coords.longitude,
+        })
+      },
+      () => {
+        // Silent fail - weather just won't show
+      },
+    )
   }, [])
 
   // Fade in animation
@@ -66,59 +88,63 @@ export default function Home() {
   const handleLogout = async () => {
     await supabase.auth.signOut()
     setUser(null)
+    // Middleware will redirect '/' -> '/auth/login' once the session is gone.
+    router.push('/auth/login')
+    router.refresh()
   }
 
   const generateOutfits = async (profile: UserProfile, analysis?: string) => {
     setIsGenerating(true)
     setFadeIn(false)
-    
+
     try {
       const response = await fetch('/api/generate-outfits', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           profile,
-          weather: weather || null,
-          photoAnalysis: analysis || photoAnalysis,
+          weather: weatherRef.current || null,
+          photoAnalysis: analysis || photoAnalysisRef.current,
         }),
       })
 
       if (!response.ok) throw new Error('Failed to generate')
 
       const data = await response.json()
-      
+
       // Transform AI response to match our types
-      const transformedOutfits: OutfitResult[] = data.outfits.map((outfit: {
-        id: string
-        name: string
-        items: Array<{
-          type: string
+      const transformedOutfits: OutfitResult[] = data.outfits.map(
+        (outfit: {
+          id: string
           name: string
-          brand: string
-          price: number
-          imageUrl: string
-          productUrl: string
-        }>
-        totalCost: number
-      }) => ({
-        id: outfit.id,
-        title: outfit.name,
-        totalCost: outfit.totalCost,
-        saved: false,
-        items: outfit.items.map((item) => ({
-          type: item.type,
-          name: `${item.brand} ${item.name}`,
-          price: item.price,
-          imageUrl: item.imageUrl,
-          buyUrl: item.productUrl,
-        })),
-      }))
+          items: Array<{
+            type: string
+            name: string
+            brand: string
+            price: number
+            imageUrl: string
+            productUrl: string
+          }>
+          totalCost: number
+        }) => ({
+          id: outfit.id,
+          title: outfit.name,
+          totalCost: outfit.totalCost,
+          saved: false,
+          items: outfit.items.map((item) => ({
+            type: item.type,
+            name: `${item.brand} ${item.name}`,
+            price: item.price,
+            imageUrl: item.imageUrl,
+            buyUrl: item.productUrl,
+          })),
+        }),
+      )
 
       setOutfits(transformedOutfits)
       setTimeout(() => setFadeIn(true), 50)
     } catch (error) {
-      console.error('Generation error:', error)
-      // Fallback to empty state
+      console.error('[v0] Generation error:', error)
       setOutfits([])
     } finally {
       setIsGenerating(false)
@@ -133,16 +159,21 @@ export default function Home() {
     }, 150)
   }
 
-  const handlePhotoUpload = useCallback(async (file: File | null, base64: string | null) => {
-    if (file && base64 && userProfile) {
-      // Analyze the photo first
+  const handlePhotoUpload = async (
+    file: File | null,
+    base64: string | null,
+  ) => {
+    const profile = userProfileRef.current
+    if (!profile) return
+
+    if (file && base64) {
       try {
         const response = await fetch('/api/analyze-photo', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
             imageBase64: base64,
-            style: userProfile.style,
+            style: profile.style,
           }),
         })
 
@@ -152,33 +183,31 @@ export default function Home() {
           setFadeIn(false)
           setTimeout(() => {
             setCurrentStep('results')
-            generateOutfits(userProfile, data.analysis)
+            generateOutfits(profile, data.analysis)
           }, 150)
           return
         }
       } catch (error) {
-        console.error('Photo analysis error:', error)
+        console.error('[v0] Photo analysis error:', error)
       }
     }
-    
+
     // If no photo or analysis failed, just generate
-    if (userProfile) {
-      setFadeIn(false)
-      setTimeout(() => {
-        setCurrentStep('results')
-        generateOutfits(userProfile)
-      }, 150)
-    }
-  }, [userProfile, weather, photoAnalysis])
+    setFadeIn(false)
+    setTimeout(() => {
+      setCurrentStep('results')
+      generateOutfits(profile)
+    }, 150)
+  }
 
   const handleSkipUpload = () => {
-    if (userProfile) {
-      setFadeIn(false)
-      setTimeout(() => {
-        setCurrentStep('results')
-        generateOutfits(userProfile)
-      }, 150)
-    }
+    const profile = userProfileRef.current
+    if (!profile) return
+    setFadeIn(false)
+    setTimeout(() => {
+      setCurrentStep('results')
+      generateOutfits(profile)
+    }, 150)
   }
 
   const handleRegenerate = () => {
@@ -188,27 +217,41 @@ export default function Home() {
   }
 
   const handleSaveOutfit = async (id: string) => {
-    const outfit = outfits.find(o => o.id === id)
+    const outfit = outfits.find((o) => o.id === id)
     if (!outfit) return
 
+    const willBeSaved = !outfit.saved
+
+    // Optimistic update
     setOutfits((prev) =>
-      prev.map((o) =>
-        o.id === id ? { ...o, saved: !o.saved } : o
-      )
+      prev.map((o) => (o.id === id ? { ...o, saved: willBeSaved } : o)),
     )
 
-    // Save to database if user is logged in
-    if (user && !outfit.saved) {
-      try {
-        await supabase.from('saved_outfits').insert({
+    if (!user) return
+
+    try {
+      if (willBeSaved) {
+        const { error } = await supabase.from('saved_outfits').insert({
           user_id: user.id,
           outfit_name: outfit.title,
           outfit_data: outfit,
           total_cost: outfit.totalCost,
         })
-      } catch (error) {
-        console.error('Save error:', error)
+        if (error) throw error
+      } else {
+        const { error } = await supabase
+          .from('saved_outfits')
+          .delete()
+          .eq('user_id', user.id)
+          .eq('outfit_name', outfit.title)
+        if (error) throw error
       }
+    } catch (error) {
+      console.error('[v0] Save error:', error)
+      // Revert optimistic update on failure
+      setOutfits((prev) =>
+        prev.map((o) => (o.id === id ? { ...o, saved: !willBeSaved } : o)),
+      )
     }
   }
 
@@ -242,7 +285,7 @@ export default function Home() {
           ) : (
             <div />
           )}
-          
+
           {user ? (
             <div className="flex items-center gap-3">
               <span className="text-xs text-muted-foreground truncate max-w-[120px]">
@@ -269,13 +312,20 @@ export default function Home() {
 
         {/* Weather display */}
         {coords && currentStep === 'form' && (
-          <div className={`mb-6 transition-all duration-300 ${fadeIn ? 'opacity-100 translate-y-0' : 'opacity-0 translate-y-2'}`}>
-            <WeatherDisplay weather={weather ?? null} isLoading={weatherLoading} />
+          <div
+            className={`mb-6 transition-all duration-300 ${fadeIn ? 'opacity-100 translate-y-0' : 'opacity-0 translate-y-2'}`}
+          >
+            <WeatherDisplay
+              weather={weather ?? null}
+              isLoading={weatherLoading}
+            />
           </div>
         )}
 
         {/* Main content with transitions */}
-        <div className={`transition-all duration-300 ${fadeIn ? 'opacity-100 translate-y-0' : 'opacity-0 translate-y-4'}`}>
+        <div
+          className={`transition-all duration-300 ${fadeIn ? 'opacity-100 translate-y-0' : 'opacity-0 translate-y-4'}`}
+        >
           {currentStep === 'form' && (
             <div className="flex flex-col gap-8">
               <div className="text-center">
@@ -283,7 +333,8 @@ export default function Home() {
                   Outfit Generator
                 </h1>
                 <p className="text-sm text-muted-foreground">
-                  Tell us about yourself to get personalized outfit recommendations
+                  Tell us about yourself to get personalized outfit
+                  recommendations
                 </p>
               </div>
               <ProfileForm onSubmit={handleProfileSubmit} />
@@ -291,7 +342,10 @@ export default function Home() {
           )}
 
           {currentStep === 'upload' && (
-            <PhotoUpload onUpload={handlePhotoUpload} onSkip={handleSkipUpload} />
+            <PhotoUpload
+              onUpload={handlePhotoUpload}
+              onSkip={handleSkipUpload}
+            />
           )}
 
           {currentStep === 'results' && (
@@ -323,7 +377,10 @@ export default function Home() {
 
               {photoAnalysis && (
                 <div className="text-xs text-muted-foreground p-3 border border-border bg-muted/50">
-                  <span className="font-medium text-foreground">Photo analysis:</span> {photoAnalysis}
+                  <span className="font-medium text-foreground">
+                    Photo analysis:
+                  </span>{' '}
+                  {photoAnalysis}
                 </div>
               )}
 
@@ -345,10 +402,7 @@ export default function Home() {
                         opacity: 0,
                       }}
                     >
-                      <OutfitCard
-                        outfit={outfit}
-                        onSave={handleSaveOutfit}
-                      />
+                      <OutfitCard outfit={outfit} onSave={handleSaveOutfit} />
                     </div>
                   ))
                 )}
